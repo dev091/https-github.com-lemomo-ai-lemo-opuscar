@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'HELP'
+Usage: lemo-dot <doctor|setup|styles|style|smoke|preview|render>
+
+  doctor                            Show dependencies and the selected browser
+  setup [voice] [music]              Install requested tiers using upstream setup
+  styles                            List the upstream styles
+  style <slug>                      Read one upstream style
+  smoke                             Render and verify a 3-second MP4
+  preview <project-dir> <seconds>…  Render frames; accepts Lemo still.mjs flags
+  render <project-dir> [options]     Render an MP4; accepts Lemo video.mjs flags
+
+Set LEMO_OPUSCAR_HOME to your existing Lemo checkout.
+Dot's default checkout is /workspace/shared/lemo-opuscar.
+PLAYWRIGHT_CHROME is an optional explicit executable override.
+HELP
+}
+
+fail() { printf 'lemo-dot: %s\n' "$*" >&2; exit 1; }
+lib=${LEMO_OPUSCAR_HOME:-/workspace/shared/lemo-opuscar}
+subcommand=${1:-help}
+case "$subcommand" in
+  -h|--help|help) usage; exit 0 ;;
+  doctor|setup|styles|style|smoke|preview|render) shift ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+lib=$(realpath -e -- "$lib") || fail 'Lemo checkout unavailable. Set LEMO_OPUSCAR_HOME.'
+[[ -f "$lib/core/render/video.mjs" && -f "$lib/package-lock.json" ]] ||
+  fail "Not a Lemo checkout: $lib"
+
+browser_path() {
+  if [[ -n ${PLAYWRIGHT_CHROME:-} ]]; then
+    [[ "$PLAYWRIGHT_CHROME" = /* ]] || fail 'PLAYWRIGHT_CHROME must be an absolute path.'
+    printf '%s\n' "$PLAYWRIGHT_CHROME"
+    return
+  fi
+  # Resolve the exact headless-shell revision used in the installed Playwright package.
+  (cd "$lib" && node -e '
+    const path = require("node:path");
+    const packageDir = path.dirname(require.resolve("playwright-core/package.json"));
+    const { registry } = require(path.join(packageDir, "lib/coreBundle")).registry;
+    const browser = registry.findExecutable("chromium-headless-shell");
+    if (!browser) process.exit(1);
+    console.log(browser.executablePath());
+  ')
+}
+
+require_browser() {
+  local browser
+  browser=$(browser_path) || fail 'Cannot resolve Playwright browser. Check node_modules or run setup.'
+  [[ -x "$browser" ]] || fail "Required browser is missing: $browser"
+  printf 'Browser: %s\n' "$browser" >&2
+}
+
+case "$subcommand" in
+  doctor)
+    printf 'Library: %s\n' "$lib"
+    git -C "$lib" rev-parse --short HEAD 2>/dev/null || true
+    node --version
+    ffmpeg -version | sed -n '1p'
+    ffprobe -version | sed -n '1p'
+    python3 - <<'PYTHON'
+import socket
+from contextlib import closing
+
+for name, family in (("AF_UNIX", socket.AF_UNIX), ("loopback", socket.AF_INET)):
+    try:
+        with closing(socket.socket(family, socket.SOCK_STREAM)) as probe:
+            if family == socket.AF_INET:
+                probe.bind(("127.0.0.1", 0))
+                probe.listen()
+        print(f"{name}: available")
+    except OSError as error:
+        print(f"{name}: errno {error.errno} ({error.strerror})")
+PYTHON
+    require_browser
+    printf 'Browser present. Run smoke to verify launch and rendering.\n'
+    ;;
+  setup)
+    if [[ $(git -C "$lib" config --get lemo.managed || true) = true ]]; then
+      fail 'This checkout is managed by upstream. Use a separate pinned checkout for setup to preserve the existing installation.'
+    fi
+    LEMO_OPUSCAR_HOME="$lib" sh "$lib/plugin/skills/lemo-opuscar/scripts/setup.sh" deps "$@"
+    ;;
+  styles)
+    cat "$lib/styles/README.md"
+    ;;
+  style)
+    [[ $# -eq 1 && "$1" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail 'Expected a style slug.'
+    [[ -f "$lib/styles/$1/STYLE.md" ]] || fail "Unknown style: $1"
+    cat "$lib/styles/$1/STYLE.md"
+    ;;
+  preview|render)
+    [[ $# -ge 1 ]] || fail 'Expected a film project directory.'
+    project=$(realpath -e -- "$1") || fail 'Film project directory unavailable.'
+    shift
+    [[ -f "$project/index.html" ]] || fail "Missing $project/index.html"
+    require_browser
+    # Keep the caller's working directory so a relative --out goes to the caller.
+    entry=video
+    if [[ "$subcommand" = preview ]]; then entry=still; fi
+    exec node "$lib/core/render/$entry.mjs" "$project" "$@"
+    ;;
+  smoke)
+    [[ $# -eq 0 ]] || fail 'smoke takes no arguments.'
+    require_browser
+    work=$(mktemp -d)
+    trap 'rm -rf -- "$work"' EXIT
+    cat > "$work/index.html" <<'HTML'
+<!doctype html><html lang="en"><meta charset="utf-8">
+<title>Lemo OpusCar smoke test</title>
+<body style="margin:0"><canvas width="1280" height="720"></canvas><script>
+const ctx = document.querySelector('canvas').getContext('2d');
+window.DUR = 3;
+window.render = t => {
+  ctx.fillStyle = '#172438';
+  ctx.fillRect(0, 0, 1280, 720);
+  ctx.fillStyle = '#ffad50';
+  ctx.fillRect(64 + t * 340, 290, 130, 130);
+};
+window.render(0);
+window.READY = true;
+</script></body></html>
+HTML
+    output="$work/render.mp4"
+    if ! timeout --kill-after=10s 120s node "$lib/core/render/video.mjs" "$work" --size 1280x720 --fps 24 --workers 1 --out "$output"; then
+      fail 'Upstream render failed. The preceding Chromium/Playwright or FFmpeg error identifies the failing step.'
+    fi
+    metadata=$(ffprobe -v error -select_streams v:0 -count_frames \
+      -show_entries stream=codec_name,width,height,nb_read_frames:format=duration -of json "$output")
+    python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+video, = data["streams"]
+assert video["codec_name"] == "h264", video
+assert (video["width"], video["height"], int(video["nb_read_frames"])) == (1280, 720, 72), video
+assert abs(float(data["format"]["duration"]) - 3) < 0.05, data["format"]
+' <<< "$metadata"
+    ffmpeg -v error -xerror -i "$output" -map 0:v:0 -f framemd5 "$work/frames.md5"
+    distinct=$(awk -F, '!/^#/ {gsub(/^[[:space:]]+/, "", $6); print $6}' "$work/frames.md5" | sort -u | wc -l)
+    (( distinct > 1 )) || fail 'MP4 decoded but its frames did not change.'
+    printf 'PASS: original Lemo renderer, H.264, 1280x720, 24 fps, 3 seconds, 72 frames (%s distinct).\n' "$distinct"
+    ;;
+esac
